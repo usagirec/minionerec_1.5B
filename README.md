@@ -1,7 +1,7 @@
 # MiniOneRec 复现（Qwen2.5-1.5B · 单卡）
 
 本仓库是对生成式推荐框架 **MiniOneRec**（语义 ID / Semantic ID + SFT + GRPO 强化学习）的一次复现，
-在**单卡**环境下用 **Qwen2.5-1.5B 全参微调**跑通完整流水线：
+在**Autodl租用单卡A800，80BG**环境（GPU训练约27h）下用 **Qwen2.5-1.5B 全参微调**跑通完整流水线：
 
 ```
 文本嵌入 → SID 构建 → 数据转换 → SFT → RL(GRPO) → 评测
@@ -11,16 +11,47 @@
 
 ---
 
-## 一、与原作参数的不同
+## 一、训练配置
 
-| 项目 | 原作 | 本复现 |
-|---|---|---|
-| Backbone | Qwen2.5-**7B** | Qwen2.5-**1.5B** |
-| 硬件 | 多卡 | **单5090** |
-| SFT 微调范围 | 多卡大 batch | **全参微调**，单卡 + 梯度累积对齐有效批量 |
-| RL batch | 8×64×2 / 16gen = 64 prompts（1024 completions） | 单卡 32×32 / 16gen = 64 prompts（**1024 completions，规模对齐**） |
-| 用户偏好 / thinking 任务 | 有 | **未做**（该任务依赖用户评论伪标注，原始评论文本不可得） |
+### 1.1 SFT 阶段（约五小时）
 
+| 参数 | 值 |
+|------|-----|
+| batch_size | 64 |
+| micro_batch_size | 8 |
+| gradient_accumulation_steps | 8 |
+| learning_rate | 3e-4 |
+| num_epochs | 5 |
+| cutoff_len | 512 |
+| optimizer | AdamW |
+| precision | bf16 |
+| scheduler | cosine with warmup |
+| early_stopping_patience | 3 |
+| freeze_LLM | False |
+| GPU 数量 | 1 |
+
+训练任务组成：
+- SidSFTDataset: 用户历史 SID 序列 -> 下一个 SID（主任务）
+- SidItemFeatDataset: 商品标题/描述 <-> SID 对齐（辅助任务）
+- FusionSeqRecDataset: 混合文本+SID 序列推荐（辅助任务）
+- 
+### 1.2 RL 阶段（GRPO）（约20小时）
+
+| 参数 | 值 |
+|------|-----|
+| train_batch_size | 64 |
+| eval_batch_size | 64 |
+| gradient_accumulation_steps | 2 |
+| learning_rate | 1e-5 |
+| num_train_epochs | 2 |
+| num_generations | 16 |
+| beta (KL penalty) | 0.01 |
+| reward_type | ranking |
+| beam_search | True |
+| temperature | 1.0 |
+| sync_ref_model | True |
+| DeepSpeed | ZeRO Stage 2 |
+| GPU 数量 | 1 |
 
 
 ## 二、环境
@@ -30,15 +61,20 @@ conda create -n MiniOneRec python=3.11 -y
 conda activate MiniOneRec
 pip install -r requirements.txt
 ```
-
-关键版本：`trl==0.24.0`、`transformers==4.57.1`、`accelerate==1.10.1`、`deepspeed==0.18.0`、
-`torch==2.6.0`（cu128）。硬件：本实验采用5090，32GB显存
-
-
+| 项目 | 配置 |
+|------|------|
+| GPU | NVIDIA A800 80GB PCIe |
+| 驱动 | NVIDIA-SMI 580.105.08 |
+| CUDA | 13.0 |
+| PyTorch | 2.8.0+cu128 |
+| Transformers | 4.57.1 |
+| TRL | 0.24.0 |
+| DeepSpeed | 0.18.0 |
+| 平台 | AutoDL |
 
 > 原始 Amazon 数据来自 UCSD；本仓库直接使用处理后的中间产物，不重新下载原始评论。
 
-## 四、复现步骤
+## 三、复现步骤
 
 ### Step 1 · 文本嵌入（可选，官方已提供 `.npy`）
 
@@ -100,7 +136,7 @@ bash evaluate.sh
 # 注意：日志中 CC 必须为 0（否则约束解码失效，模型生成了不存在的商品）
 ```
 
-## 五、混合ID实验
+## 四、混合ID对比实验
 
 ### 混合语义 ID（文本嵌入 + 协同嵌入拼接）
 
@@ -123,7 +159,7 @@ bash evaluate.sh
 决定性因素是它是否编码了对用户偏好有用的结构。该负结果直接影响了后续优先级排序
 （先补齐模型规模与偏好任务，再回头优化 SID）。
 
-## 六、结论
+## 五、结论
 
 数据集 **Industrial_and_Scientific**，每条样本单正例，故 HR@K = Recall@K。
 下表把本复现（Qwen2.5-**1.5B**，单卡）插入论文 Table 1，对比全部 baseline，并标出与作者原版的差异。
@@ -155,14 +191,15 @@ bash evaluate.sh
    下游指标与基线基本持平（HR@10 0.1381 对 0.1398），
    说明语义 ID 的可分性是**必要而非充分条件**。
 
+
+
 ## 七、后续计划（TODO）
 
 - [ ] **P1 · 完成 7B 多卡复现** —— 直接闭合与作者 7B 的差距，pipeline 已就绪，仅差多卡资源。
-- [ ] **P2 · 补齐用户偏好 / thinking 任务** —— 拿到带评论的数据即可补齐，预期改善冷启动与长尾场景。
-- [ ] **P3 · 继续优化混合语义 ID** —— 当前版本把协同嵌入与文本嵌入等权拼接，协同信号可能被过度放大；
+- [ ] **P2 · 继续优化混合语义 ID** —— 当前版本把协同嵌入与文本嵌入等权拼接，协同信号可能被过度放大；
       下一步给协同分支加可调缩放系数做网格搜索，并配合碰撞去重后处理重新评估下游。
-- [ ] **P4 · 更泛化的实现** —— 数据 / 类目 / backbone / 超参完全配置化，一键切换。
-- [ ] **P5 · 拓展到多模态** —— 引入图像 / 价格 / 属性等信号参与 SID 构建与生成推荐。
+- [ ] **P3 · 在更多数据集上验证（Office_Products、Amazon23）。
+- [ ] **P4 · 探索不同超参数。
 
 ## 八、致谢
 
